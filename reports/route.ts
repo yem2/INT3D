@@ -1,0 +1,55 @@
+import { NextResponse } from 'next/server'
+import { pool } from '@/lib/db'
+import { bad, gate, isUuid, readJson, toDateOnly } from '@/lib/http'
+import { can } from '@/lib/authz'
+import { logAudit } from '@/lib/audit'
+import { notifyAdmins } from '@/lib/notify'
+
+const COLS = `r.id, e.name as "employeeName", r.attachment_id as "attachmentId", d.name as "attachmentName", r.kind, r.period_start::text as "periodStart", r.period_end::text as "periodEnd", r.content, r.created_at as "createdAt"`
+const FROM = 'from reports r left join employees e on e.id = r.employee_id left join documents d on d.id = r.attachment_id'
+const MAX_BYTES = 2.5 * 1024 * 1024
+import { validateUpload } from '@/lib/files'
+
+export async function GET() {
+  const g = await gate(); if (!g.ok) return g.res
+  const { actor } = g
+  if (can(actor, 'reports_all')) return NextResponse.json((await pool.query(`select ${COLS} ${FROM} order by r.created_at desc limit 300`)).rows)
+  if (!actor.employeeId) return NextResponse.json([])
+  return NextResponse.json((await pool.query(`select ${COLS} ${FROM} where r.employee_id = $1 order by r.created_at desc`, [actor.employeeId])).rows)
+}
+
+export async function POST(request: Request) {
+  const g = await gate(); if (!g.ok) return g.res
+  const b = await readJson<{ kind: string; periodStart: string; periodEnd: string; content: string; employeeId: string; attachment: { name: string; data: string } }>(request)
+  const att = b.attachment && typeof b.attachment === 'object' ? b.attachment : null
+  const content = b.content?.trim() ?? ''
+  if (!content && !att) return bad('Écrivez le rapport ou joignez un document.')
+  const employeeId = g.actor.role === 'admin' && isUuid(b.employeeId) ? b.employeeId : g.actor.employeeId
+  let file: { name: string; mime: string; bytes: Buffer } | null = null
+  if (att) {
+    if (!employeeId) return bad('Aucun dossier employé n’est lié à votre compte : impossible de joindre un fichier.')
+    const checked = validateUpload(att, MAX_BYTES)
+    if ('error' in checked) return bad(checked.error)
+    file = checked
+  }
+  const client = await pool.connect()
+  try {
+    await client.query('begin')
+    let attachmentId: string | null = null
+    if (file) {
+      const doc = await client.query('insert into documents (employee_id, category, name, mime_type, size_bytes, uploaded_by) values ($1,$2,$3,$4,$5,$6) returning id', [employeeId, 'Rapport', file.name, file.mime, file.bytes.length, g.actor.id])
+      attachmentId = doc.rows[0].id
+      await client.query('insert into document_files (document_id, data) values ($1, $2)', [attachmentId, file.bytes])
+    }
+    const { rows } = await client.query('insert into reports (employee_id, kind, period_start, period_end, content, attachment_id) values ($1,$2,$3,$4,$5,$6) returning id',
+      [employeeId, b.kind?.trim() || 'activité', toDateOnly(b.periodStart), toDateOnly(b.periodEnd), content.slice(0, 10000), attachmentId])
+    await client.query('commit')
+    await logAudit(g.actor, 'create', 'report', rows[0].id, { kind: b.kind, attachment: file?.name })
+    if (g.actor.role !== 'admin') await notifyAdmins('Nouveau rapport', `${g.actor.name} · ${b.kind?.trim() || 'activité'}${file ? ' · fichier joint' : ''}`, '/#rapports')
+    return NextResponse.json({ id: rows[0].id }, { status: 201 })
+  } catch (error) {
+    await client.query('rollback').catch(() => {})
+    console.error('[reports] création', error)
+    return bad('Envoi impossible.', 500)
+  } finally { client.release() }
+}

@@ -1,0 +1,73 @@
+import { NextResponse } from 'next/server'
+import { pool } from '@/lib/db'
+import { bad, gate, isUuid, notFound, readJson } from '@/lib/http'
+import { can, forbidden } from '@/lib/authz'
+import { balances } from '@/lib/leave-balance'
+import { readSettings } from '@/lib/settings'
+import { DEDUCTING_TYPES, parseExtraHolidays, workingDays } from '@/lib/leaves'
+import { logAudit } from '@/lib/audit'
+import { notifyAdmins, notifyEmployee } from '@/lib/notify'
+
+const COLS = `l.id, l.employee_id as "employeeId", e.name as "employeeName", l.type, l.starts_at as "startsAt", l.ends_at as "endsAt", l.reason, l.status, l.review_comment as "reviewComment", l.created_at as "createdAt"`
+const FROM = 'from leave_requests l left join employees e on e.id = l.employee_id'
+
+export async function GET() {
+  const g = await gate(); if (!g.ok) return g.res
+  const { actor } = g
+  if (can(actor, 'leaves_all')) return NextResponse.json((await pool.query(`select ${COLS} ${FROM} order by l.created_at desc limit 500`)).rows)
+  if (actor.perms.includes('leaves_team') && actor.team) return NextResponse.json((await pool.query(`select ${COLS} ${FROM} where e.team = $1 order by l.created_at desc limit 500`, [actor.team])).rows)
+  if (!actor.employeeId) return NextResponse.json([])
+  return NextResponse.json((await pool.query(`select ${COLS} ${FROM} where l.employee_id = $1 order by l.created_at desc`, [actor.employeeId])).rows)
+}
+
+export async function POST(request: Request) {
+  const g = await gate(); if (!g.ok) return g.res
+  const { actor } = g
+  const b = await readJson<{ employeeId: string; type: string; startsAt: string; endsAt: string; reason: string }>(request)
+  const employeeId = actor.role === 'admin' && isUuid(b.employeeId) ? b.employeeId : actor.employeeId
+  if (!employeeId) return bad('Aucun dossier employé n’est lié à votre compte.')
+  const type = b.type?.trim()
+  const start = b.startsAt ? new Date(b.startsAt) : null, end = b.endsAt ? new Date(b.endsAt) : null
+  if (!type || !start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return bad('Type et dates requis.')
+  if (end < start) return bad('La date de fin précède la date de début.')
+  if (DEDUCTING_TYPES.includes(type)) { // le congé payé ne peut pas dépasser le solde annuel
+    const settings = await readSettings(), extra = parseExtraHolidays(settings.holidays_extra)
+    const year = start.getUTCFullYear(), within = { from: new Date(Date.UTC(year, 0, 1)), to: new Date(Date.UTC(year, 11, 31)) }
+    const requested = workingDays(start, end, extra, within)
+    const bal = year === new Date().getUTCFullYear() ? (await balances([employeeId]))[0] : null
+    if (requested === 0) return bad('Cette période ne contient aucun jour ouvrable (dimanches et jours fériés exclus).')
+    if (bal && requested > bal.remaining) return bad(`Solde insuffisant : ${requested} jour(s) demandé(s), ${bal.remaining} restant(s) sur ${bal.annual} cette année (congés en attente inclus).`)
+  }
+  const { rows } = await pool.query(
+    `insert into leave_requests (employee_id, leave_type_id, type, starts_at, ends_at, reason) values ($1, (select id from leave_types where name = $2 limit 1), $2, $3, $4, $5) returning id`,
+    [employeeId, type, start, end, b.reason?.trim() || null])
+  await logAudit(actor, 'create', 'leave_request', rows[0].id, { type })
+  const { rows: emp } = await pool.query('select name from employees where id = $1', [employeeId])
+  await notifyAdmins('Nouvelle demande de congé', `${emp[0]?.name ?? 'Un employé'} · ${type}`, '/#conges')
+  const { rows: created } = await pool.query(`select ${COLS} ${FROM} where l.id = $1`, [rows[0].id])
+  return NextResponse.json(created[0], { status: 201 })
+}
+
+// Validation / refus par un administrateur.
+export async function PATCH(request: Request) {
+  const g = await gate(); if (!g.ok) return g.res
+  const b = await readJson<{ id: string; status: string; comment: string }>(request)
+  if (!isUuid(b.id)) return bad('Identifiant requis.')
+  { // séparation des tâches : personne ne valide sa propre demande (le super administrateur, seul au sommet, peut le faire)
+    const own = await pool.query('select employee_id from leave_requests where id = $1', [b.id])
+    if (own.rows[0] && own.rows[0].employee_id === g.actor.employeeId && !g.actor.superAdmin) return bad('Vous ne pouvez pas valider votre propre demande : un autre responsable doit le faire.', 403)
+  }
+  if (!can(g.actor, 'leaves_all')) { // manager : uniquement les demandes de son équipe, jamais les siennes
+    if (!g.actor.perms.includes('leaves_team') || !g.actor.team) return forbidden()
+    const t = await pool.query('select e.team, e.id from leave_requests l join employees e on e.id = l.employee_id where l.id = $1', [b.id])
+    if (!t.rows[0] || t.rows[0].team !== g.actor.team) return forbidden()
+    if (t.rows[0].id === g.actor.employeeId) return bad('Vous ne pouvez pas valider votre propre demande.', 403)
+  }
+  if (b.status !== 'Approuvée' && b.status !== 'Refusée') return bad('Statut invalide.')
+  const { rows } = await pool.query(`update leave_requests set status = $2, reviewed_by = $3, reviewed_at = now(), review_comment = $4 where id = $1 returning employee_id, type`, [b.id, b.status, g.actor.id, b.comment?.trim() || null])
+  if (!rows[0]) return notFound('Demande introuvable.')
+  await logAudit(g.actor, 'update', 'leave_request', b.id, { status: b.status })
+  await notifyEmployee(rows[0].employee_id, `Congé ${b.status.toLowerCase()}`, rows[0].type, '/#conges')
+  const { rows: updated } = await pool.query(`select ${COLS} ${FROM} where l.id = $1`, [b.id])
+  return NextResponse.json(updated[0])
+}
