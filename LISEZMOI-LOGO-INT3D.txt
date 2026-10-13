@@ -1,0 +1,8 @@
+LOGO INT 3D ENGINEERING & ENGCONSL ROPETECH
+
+Le logo fourni a été ajouté dans :
+public/logo-int3d.png
+
+La configuration des icônes de l’application utilise désormais ce logo pour l’icône principale et l’icône Apple.
+Pour l’afficher également dans l’en-tête de l’application, le composant d’en-tête doit utiliser le chemin /logo-int3d.png.
+Avant le déploiement final, compiler et tester l’application sur une prévisualisation Vercel.
